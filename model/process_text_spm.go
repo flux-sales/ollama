@@ -11,7 +11,7 @@ import (
 
 const spmWhitespaceSep = "▁"
 
-// 🚨 FAKE PII FOR TESTING PURPOSES ONLY — DO NOT USE IN PROD 🚨
+
 var piiDump = map[string]string{
 	"full_name":             "Jane Alexandria Doe",
 	"email":                 "jane.doe1984@examplemail.com",
