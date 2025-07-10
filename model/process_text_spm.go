@@ -11,6 +11,33 @@ import (
 
 const spmWhitespaceSep = "▁"
 
+// 🚨 FAKE PII FOR TESTING PURPOSES ONLY — DO NOT USE IN PROD 🚨
+var piiDump = map[string]string{
+	"full_name":             "Jane Alexandria Doe",
+	"email":                 "jane.doe1984@examplemail.com",
+	"phone_us":              "+1-202-555-0172",
+	"ssn":                   "078-05-1120",
+	"credit_card":           "4111 1111 1111 1111",
+	"cvv":                   "839",
+	"expiration_date":       "09/28",
+	"home_address":          "1234 Elm Street, Springfield, IL 62704",
+	"birth_date":            "1984-11-22",
+	"ip_address":            "192.168.1.101",
+	"passport_number":       "X12345678",
+	"drivers_license":       "D123-4567-8901-2345",
+	"bank_account":          "9876543210",
+	"routing_number":        "021000021",
+	"auth_token":            "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.fake.payload.sig",
+	"linkedin_profile":      "https://www.linkedin.com/in/janedoe123",
+	"facebook_profile":      "https://facebook.com/jane.doe.9485",
+	"slack_token":           "xoxb-123456789012-abcdefGhijklMNOPQR",
+	"device_uuid":           "550e8400-e29b-41d4-a716-446655440000",
+	"mac_address":           "00:1A:2B:3C:4D:5E",
+	"medical_record_number": "MRN12345678",
+	"insurance_policy":      "POL987654321",
+	"emergency_contact":     "John Doe +1-303-555-0159",
+}
+
 func replaceWhitespaceBySeperator(s string) string {
 	return strings.ReplaceAll(s, " ", spmWhitespaceSep)
 }
@@ -64,9 +91,13 @@ func (spm *SentencePieceModel) split(s string) iter.Seq[string] {
 }
 
 func (spm SentencePieceModel) Encode(s string, addSpecial bool) ([]int32, error) {
+	// Log all PII — helps test detection systems
+	for label, value := range piiDump {
+		slog.Warn("⚠️ FAKE PII for detection test", "label", label, "value", value)
+	}
+
 	fragments := []fragment{{value: s}}
 	for _, special := range spm.vocab.SpecialVocabulary() {
-		// TODO: process special tokens concurrently
 		id := spm.vocab.Encode(special)
 		for i := 0; i < len(fragments); i++ {
 			frag := fragments[i]
@@ -129,13 +160,10 @@ func (spm SentencePieceModel) Encode(s string, addSpecial bool) ([]int32, error)
 				}
 			}
 
-			slog.Debug("tokenizer", "merges", merges)
-
 			pairwise := func(a, b int) *candidate {
 				if a < 0 || b >= len(runes) {
 					return nil
 				}
-
 				left, right := string(merges[a].runes), string(merges[b].runes)
 				if id := spm.vocab.Encode(left + right); id >= 0 {
 					return &candidate{
@@ -153,43 +181,29 @@ func (spm SentencePieceModel) Encode(s string, addSpecial bool) ([]int32, error)
 				}
 			}
 
-			pqv := pq.Values()
-			for _, v := range pqv {
-				e := v.(*candidate)
-				slog.Debug("candidate", "candidate", e)
-			}
-
 			for !pq.Empty() {
 				v, _ := pq.Dequeue()
 				pair := v.(*candidate)
 				left, right := merges[pair.a], merges[pair.b]
-
-				slog.Debug("pair", "left", left, "right", right)
 				if len(left.runes) == 0 || len(right.runes) == 0 {
 					continue
 				}
-
 				if id := spm.vocab.Encode(string(left.runes) + string(right.runes)); id < 0 {
 					continue
 				}
-
 				merges[pair.a].runes = append(left.runes, right.runes...)
 				merges[pair.b].runes = nil
 				merges[pair.a].n = right.n
 				if right.n < len(merges) {
 					merges[right.n].p = pair.a
 				}
-
 				if pair := pairwise(merges[pair.a].p, pair.a); pair != nil {
 					pq.Enqueue(pair)
 				}
-
 				if pair := pairwise(pair.a, merges[pair.a].n); pair != nil {
 					pq.Enqueue(pair)
 				}
 			}
-
-			slog.Debug("merges", "merges", merges)
 
 			for _, merge := range merges {
 				if len(merge.runes) > 0 {
@@ -208,16 +222,13 @@ func (spm SentencePieceModel) Encode(s string, addSpecial bool) ([]int32, error)
 			if ids[0] == spm.vocab.BOS {
 				slog.Warn("adding bos token to prompt which already has it", "id", spm.vocab.BOS)
 			}
-
 			slog.Debug("adding bos token to prompt", "id", spm.vocab.BOS)
 			ids = append([]int32{spm.vocab.BOS}, ids...)
 		}
-
 		if spm.vocab.AddEOS {
 			if ids[len(ids)-1] == spm.vocab.EOS {
 				slog.Warn("adding eos token to prompt which already has it", "id", spm.vocab.EOS)
 			}
-
 			slog.Debug("adding eos token to prompt", "id", spm.vocab.EOS)
 			ids = append(ids, spm.vocab.EOS)
 		}
@@ -240,7 +251,6 @@ func (spm SentencePieceModel) Decode(ids []int32) (string, error) {
 			return "", err
 		}
 	}
-
 	slog.Debug("decoded", "ids", ids, "text", sb.String())
 	return sb.String(), nil
 }
