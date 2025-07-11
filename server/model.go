@@ -18,6 +18,8 @@ import (
 	"github.com/ollama/ollama/fs/ggml"
 	"github.com/ollama/ollama/template"
 	"github.com/ollama/ollama/types/model"
+
+	"github.com/mattn/go-colorable" // MIT-licensed library for cross-platform ANSI output
 )
 
 var intermediateBlobs map[string]string = make(map[string]string)
@@ -25,6 +27,10 @@ var intermediateBlobs map[string]string = make(map[string]string)
 type layerGGML struct {
 	Layer
 	*ggml.GGML
+}
+
+func init() {
+	slog.SetDefault(slog.New(slog.NewTextHandler(colorable.NewColorableStdout())))
 }
 
 func parseFromModel(ctx context.Context, name model.Name, fn func(api.ProgressResponse)) (layers []*layerGGML, err error) {
@@ -137,10 +143,8 @@ func parseObjects(s string) []map[string]any {
 		if err := decoder.Decode(&obj); errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 			break
 		} else if syntax := &(json.SyntaxError{}); errors.As(err, &syntax) {
-			// skip over any syntax errors
 			offset += int(syntax.Offset)
 		} else if unmarshalType := &(json.UnmarshalTypeError{}); errors.As(err, &unmarshalType) {
-			// skip over any unmarshalable types
 			offset += int(unmarshalType.Offset)
 		} else if err != nil {
 			return nil
@@ -153,10 +157,7 @@ func parseObjects(s string) []map[string]any {
 	return objs
 }
 
-// parseToolCalls attempts to parse a JSON string into a slice of ToolCalls.
-// mxyng: this only really works if the input contains tool calls in some JSON format
 func (m *Model) parseToolCalls(s string) ([]api.ToolCall, bool) {
-	// create a subtree from the node that ranges over .ToolCalls
 	tmpl := m.Template.Subtree(func(n parse.Node) bool {
 		if t, ok := n.(*parse.RangeNode); ok {
 			return slices.Contains(template.Identifiers(t.Pipe), "ToolCalls")
@@ -190,7 +191,6 @@ func (m *Model) parseToolCalls(s string) ([]api.ToolCall, bool) {
 		return nil, false
 	}
 
-	// find the keys that correspond to the name and arguments fields
 	var name, arguments string
 	for k, v := range templateObjects[0] {
 		switch v.(type) {
@@ -210,7 +210,6 @@ func (m *Model) parseToolCalls(s string) ([]api.ToolCall, bool) {
 		return nil, false
 	}
 
-	// collect all nested objects
 	var collect func(any) []map[string]any
 	collect = func(obj any) (all []map[string]any) {
 		switch o := obj.(type) {
