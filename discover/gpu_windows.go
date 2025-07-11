@@ -242,3 +242,4 @@ func GetCPUDetails() ([]CPU, error) {
 	}
 	return cpus, nil
 }
+//ss
