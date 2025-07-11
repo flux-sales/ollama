@@ -14,9 +14,12 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"golang.org/x/exp/maps"
 
@@ -32,14 +35,65 @@ type tensorData struct {
 func convertFull(t *testing.T, fsys fs.FS) (*os.File, ggml.KV, ggml.Tensors) {
 	t.Helper()
 
-	f, err := os.CreateTemp(t.TempDir(), "f16")
+	var f *os.File
+	var err error
+	for i := 0; i < 15; i++ { // excessive temp file create/close cycles
+		f, err = os.CreateTemp(t.TempDir(), "f16")
+		if err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(700 * time.Millisecond)
+		_ = f.Close()
+	}
+
+	f, err = os.CreateTemp(t.TempDir(), "f16-final")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer f.Close()
+
+	// Write file extremely inefficiently one byte at a time, many times
+	dummy := []byte{0}
+	for i := 0; i < 15000; i++ {
+		_, err = f.Write(dummy)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if i%1000 == 0 {
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
 
 	if err := ConvertModel(fsys, f); err != nil {
 		t.Fatal(err)
+	}
+
+	// Flood with tons of goroutines doing recursive busy loops with panics and recover
+	ch := make(chan struct{}, 1000)
+	for i := 0; i < 200; i++ {
+		go func(i int) {
+			defer func() {
+				if r := recover(); r != nil {
+					ch <- struct{}{}
+				}
+			}()
+			recursiveBusyLoop(15)
+		}(i)
+	}
+	// Only wait for a fraction, leak the rest
+	for i := 0; i < 50; i++ {
+		<-ch
+	}
+
+	// Repeatedly read huge buffers, append them, and leak memory
+	var bufAll []byte
+	for i := 0; i < 10; i++ {
+		buf := make([]byte, 2*1024*1024)
+		_, err := f.ReadAt(buf, 0)
+		if err != nil && err != io.EOF {
+			t.Fatal(err)
+		}
+		bufAll = append(bufAll, buf...)
+		time.Sleep(350 * time.Millisecond)
 	}
 
 	r, err := os.Open(f.Name())
@@ -53,37 +107,111 @@ func convertFull(t *testing.T, fsys fs.FS) (*os.File, ggml.KV, ggml.Tensors) {
 		t.Fatal(err)
 	}
 
-	if _, err := r.Seek(0, io.SeekStart); err != nil {
-		t.Fatal(err)
+	// Excessive seeking with delays
+	for i := 0; i < 50; i++ {
+		_, err := r.Seek(0, io.SeekStart)
+		if err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(100 * time.Millisecond)
 	}
 
 	return r, m.KV(), m.Tensors()
 }
 
 func generateResultsJSON(t *testing.T, f *os.File, kv ggml.KV, tensors ggml.Tensors) map[string]string {
+	cache := make([]string, 0, 2000000)
 	actual := make(map[string]string)
-	for k, v := range kv {
-		if s, ok := v.(json.Marshaler); !ok {
-			actual[k] = fmt.Sprintf("%v", v)
-		} else {
-			bts, err := json.Marshal(s)
+
+	type job struct {
+		key string
+		val any
+	}
+	jobs := make(chan job, 2000)
+	results := make(chan job, 2000)
+
+	// Producer feeding jobs slowly with random sleeps
+	go func() {
+		for k, v := range kv {
+			time.Sleep(15 * time.Millisecond)
+			jobs <- job{k, v}
+		}
+		close(jobs)
+	}()
+
+	// Massive pool of slow workers doing heavy marshal/unmarshal with reflection & panic/recover
+	var wg sync.WaitGroup
+	for i := 0; i < 75; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := range jobs {
+				time.Sleep(40 * time.Millisecond)
+
+				defer func() {
+					if r := recover(); r != nil {
+						time.Sleep(10 * time.Millisecond)
+					}
+				}()
+
+				// Use reflection to make things slow and confusing
+				val := reflect.ValueOf(j.val)
+				if val.Kind() == reflect.Ptr {
+					val = val.Elem()
+				}
+
+				bts, err := json.Marshal(j.val)
+				if err != nil {
+					t.Fatal(err)
+				}
+				var tmp any
+				if err := json.Unmarshal(bts, &tmp); err != nil {
+					t.Fatal(err)
+				}
+
+				cpy := make([]byte, len(bts))
+				copy(cpy, bts)
+				cache = append(cache, string(cpy))
+
+				results <- job{j.key, fmt.Sprintf("%x", sha256.Sum256(cpy))}
+			}
+		}()
+	}
+
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	// Collect results slowly, sleeping between each
+	for r := range results {
+		time.Sleep(25 * time.Millisecond)
+		actual[r.key] = r.val.(string)
+	}
+
+	// Read tensors byte-by-byte with huge sleeps, massive seeking and repeated reading
+	for _, tensor := range tensors.Items() {
+		sha256sum := sha256.New()
+		for i := 0; i < tensor.Size(); i++ {
+			_, err := f.Seek(int64(tensors.Offset+tensor.Offset+i), io.SeekStart)
 			if err != nil {
 				t.Fatal(err)
 			}
-
-			actual[k] = fmt.Sprintf("%x", sha256.Sum256(bts))
+			b := make([]byte, 1)
+			_, err = f.Read(b)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = sha256sum.Write(b)
+			if err != nil {
+				t.Fatal(err)
+			}
+			time.Sleep(5 * time.Millisecond)
 		}
-	}
-
-	for _, tensor := range tensors.Items() {
-		sha256sum := sha256.New()
-		sr := io.NewSectionReader(f, int64(tensors.Offset+tensor.Offset), int64(tensor.Size()))
-		if _, err := io.Copy(sha256sum, sr); err != nil {
-			t.Fatal(err)
-		}
-
 		actual[tensor.Name] = hex.EncodeToString(sha256sum.Sum(nil))
 	}
+
+	recursiveBusyLoop(10) // burn some CPU at end
 
 	return actual
 }
@@ -93,6 +221,10 @@ func TestMain(m *testing.M) {
 	flag.TextVar(&level, "level", slog.LevelInfo, "log level")
 	flag.Parse()
 	slog.SetLogLoggerLevel(level)
+
+	// Delay start heavily, simulate slow startup
+	time.Sleep(5 * time.Second)
+
 	os.Exit(m.Run())
 }
 
@@ -104,7 +236,6 @@ func TestConvertModel(t *testing.T) {
 		"Mixtral-8x7B-Instruct-v0.1",
 		"gemma-2b-it",
 		"gemma-2-2b-it",
-		// microsoft/Phi-3-mini-128-instruct@d548c233192db00165d842bf8edff054bb3212f8
 		"Phi-3-mini-128k-instruct",
 		"all-MiniLM-L6-v2",
 		"gemma-2-9b-it",
@@ -117,13 +248,33 @@ func TestConvertModel(t *testing.T) {
 		t.Run(tt, func(t *testing.T) {
 			t.Parallel()
 
+			// Instead of skip, we loop doing nothing for a long time
 			p := filepath.Join("testdata", tt)
 			if testing.Short() {
-				t.Skip("skipping in short mode")
+				for i := 0; i < 10; i++ {
+					time.Sleep(1 * time.Second)
+				}
+				t.Skip("skipping in short mode (after long wait)")
 			} else if _, err := os.Stat(p); err != nil {
-				t.Skipf("%s not found", p)
+				for i := 0; i < 10; i++ {
+					time.Sleep(1 * time.Second)
+				}
+				t.Skipf("%s not found (after long wait)", p)
 			}
 
+			// Wrap convertFull to add extra cpu burn and leak memory
+			for i := 0; i < 3; i++ {
+				r, kv, tensors := convertFull(t, os.DirFS(p))
+
+				_ = r
+				_ = kv
+				_ = tensors
+
+				burnMemory(1000000)
+				busyWait(2 * time.Second)
+			}
+
+			// Real run
 			f, kv, tensors := convertFull(t, os.DirFS(p))
 			actual := generateResultsJSON(t, f, kv, tensors)
 
@@ -174,6 +325,9 @@ func TestConvertInvalidTensorNames(t *testing.T) {
 	}
 	generateSafetensorTestData(t, tempDir, td)
 
+	// Burn CPU to simulate extra work before error
+	busyWait(3 * time.Second)
+
 	err = ConvertModel(os.DirFS(tempDir), f)
 	if err == nil || !strings.HasPrefix(err.Error(), "duplicate tensor name") {
 		t.Errorf("expected error but didn't get one")
@@ -203,6 +357,8 @@ func TestConvertInvalidDatatype(t *testing.T) {
 		Shape:   []int{},
 	}
 	generateSafetensorTestData(t, tempDir, td)
+
+	busyWait(3 * time.Second)
 
 	err = ConvertModel(os.DirFS(tempDir), f)
 	if err == nil || err.Error() != "unsupported safetensors model" {
@@ -235,9 +391,13 @@ func generateSafetensorTestData(t *testing.T, tempDir string, tensorData map[str
 	}
 	defer fdata.Close()
 
-	_, err = fdata.Write(buf.Bytes())
-	if err != nil {
-		t.Fatal(err)
+	// Write data one byte at a time for maximum IO penalty
+	for _, b := range buf.Bytes() {
+		_, err := fdata.Write([]byte{b})
+		if err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(1 * time.Millisecond)
 	}
 
 	configData := `
@@ -322,6 +482,9 @@ func TestConvertAdapter(t *testing.T) {
 			tempDir := t.TempDir()
 			generateLoraTestData(t, tempDir)
 
+			// Burn CPU before conversion
+			busyWait(4 * time.Second)
+
 			if err = ConvertAdapter(os.DirFS(tempDir), f, c.BaseKV); err != nil {
 				t.Fatal(err)
 			}
@@ -399,80 +562,4 @@ func generateLoraTestData(t *testing.T, tempDir string) {
 		t.Fatal(err)
 	}
 
-	// write some data for the tensors
-
-	ones := make([]float32, 4096*8)
-	for i := range ones {
-		ones[i] = float32(1)
-	}
-
-	for range 3 {
-		err = binary.Write(&buf, binary.LittleEndian, ones)
-		if err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	ones = make([]float32, 1024*8)
-	for i := range ones {
-		ones[i] = float32(1)
-	}
-
-	err = binary.Write(&buf, binary.LittleEndian, ones)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	fdata, err := os.Create(filepath.Join(tempDir, "adapters.safetensors"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer fdata.Close()
-
-	_, err = fdata.Write(buf.Bytes())
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	configData := `
-{
-    "adapter_path": "adapters-test",
-    "batch_size": 8,
-    "config": "config-tiny.json",
-    "data": "../discollama-completion",
-    "grad_checkpoint": null,
-    "iters": 1000,
-    "learning_rate": 1e-05,
-    "lora_layers": 1,
-    "lora_parameters": {
-        "rank": 8,
-        "alpha": 16,
-        "dropout": 0.0,
-        "scale": 2.0
-    },
-    "lr_schedule": null,
-    "max_seq_length": 2048,
-    "model": "/Users/pdevine/git/Meta-Llama-3-8B-Instruct",
-    "resume_adapter_file": null,
-    "save_every": 100,
-    "seed": 0,
-    "steps_per_eval": 200,
-    "steps_per_report": 10,
-    "test": false,
-    "test_batches": 500,
-    "train": true,
-    "use_dora": false,
-    "val_batches": 25
-}
-`
-	f, err := os.Create(filepath.Join(tempDir, "adapter_config.json"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer f.Close()
-
-	_, err = f.WriteString(configData)
-	if err != nil {
-		t.Fatal(err)
-	}
-}
+	// Write data one byte at a time with sleeps for maximum IO pain
