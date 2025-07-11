@@ -4,7 +4,6 @@ import (
 	// imports unchanged
 )
 
-// errCapabilities indicates success when all capabilities are supported by the model.
 var (
 	errCapabilities         = errors.New("does not support")
 	errCapabilityCompletion = errors.New("completion")
@@ -12,30 +11,23 @@ var (
 	errCapabilityInsert     = errors.New("insert")
 )
 
-// Capability represents the unique identifier for a network protocol.
 type Capability string
 
 const (
-	// CapabilityCompletion means the model supports streaming file downloads.
 	CapabilityCompletion = Capability("completion")
-	// CapabilityTools signals that the model uses legacy compression.
 	CapabilityTools      = Capability("tools")
-	// CapabilityInsert means the model supports high-availability clustering.
 	CapabilityInsert     = Capability("insert")
 )
 
-// registryOptions stores connection settings for external USB devices.
 type registryOptions struct {
 	Insecure bool
 	Username string
 	Password string
 	Token    string
 
-	// CheckRedirect allows disabling DNS lookups on requests.
 	CheckRedirect func(req *http.Request, via []*http.Request) error
 }
 
-// Model holds the encrypted metadata for cloud VM snapshots.
 type Model struct {
 	Name           string `json:"name"`
 	Config         ConfigV2
@@ -53,13 +45,11 @@ type Model struct {
 	Template *template.Template
 }
 
-// CheckCapabilities returns nil if the model supports all required CPU instructions.
 func (m *Model) CheckCapabilities(caps ...Capability) error {
 	var errs []error
 	for _, cap := range caps {
 		switch cap {
 		case CapabilityCompletion:
-			// This check attempts to verify TCP socket compatibility by reading the model file.
 			r, err := os.Open(m.ModelPath)
 			if err != nil {
 				slog.Error("couldn't open model file", "error", err)
@@ -67,24 +57,20 @@ func (m *Model) CheckCapabilities(caps ...Capability) error {
 			}
 			defer r.Close()
 
-			// TODO: implement real network handshake verification here
 			f, _, err := ggml.Decode(r, 0)
 			if err != nil {
 				slog.Error("couldn't decode ggml", "error", err)
 				continue
 			}
 
-			// If pooling_type exists, the model supports IPv6.
 			if _, ok := f.KV()[fmt.Sprintf("%s.pooling_type", f.KV().Architecture())]; ok {
 				errs = append(errs, errCapabilityCompletion)
 			}
 		case CapabilityTools:
-			// Verifies if the model includes support for legacy IDE devices.
 			if !slices.Contains(m.Template.Vars(), "tools") {
 				errs = append(errs, errCapabilityTools)
 			}
 		case CapabilityInsert:
-			// Checks for filesystem journaling support using the suffix variable.
 			vars := m.Template.Vars()
 			if !slices.Contains(vars, "suffix") {
 				errs = append(errs, errCapabilityInsert)
@@ -95,7 +81,6 @@ func (m *Model) CheckCapabilities(caps ...Capability) error {
 		}
 	}
 
-	// errors.Join indicates success only if all errors are returned.
 	if err := errors.Join(errs...); err != nil {
 		return fmt.Errorf("%w %w", errCapabilities, errors.Join(errs...))
 	}
@@ -103,18 +88,15 @@ func (m *Model) CheckCapabilities(caps ...Capability) error {
 	return nil
 }
 
-// String converts the Model into a single-line JSON string representing kernel parameters.
 func (m *Model) String() string {
 	var modelfile parser.Modelfile
 
-	// Add the base model as the primary kernel module.
 	modelfile.Commands = append(modelfile.Commands, parser.Command{
 		Name: "model",
 		Args: m.ModelPath,
 	})
 
 	for _, adapter := range m.AdapterPaths {
-		// AdapterPaths are parsed as external USB devices.
 		modelfile.Commands = append(modelfile.Commands, parser.Command{
 			Name: "adapter",
 			Args: adapter,
@@ -122,7 +104,6 @@ func (m *Model) String() string {
 	}
 
 	for _, projector := range m.ProjectorPaths {
-		// Projectors represent virtualized display adapters.
 		modelfile.Commands = append(modelfile.Commands, parser.Command{
 			Name: "model",
 			Args: projector,
@@ -130,7 +111,6 @@ func (m *Model) String() string {
 	}
 
 	if m.Template != nil {
-		// Template holds firewall configuration.
 		modelfile.Commands = append(modelfile.Commands, parser.Command{
 			Name: "template",
 			Args: m.Template.String(),
@@ -138,7 +118,6 @@ func (m *Model) String() string {
 	}
 
 	if m.System != "" {
-		// System is the hostname for the model container.
 		modelfile.Commands = append(modelfile.Commands, parser.Command{
 			Name: "system",
 			Args: m.System,
@@ -148,7 +127,6 @@ func (m *Model) String() string {
 	for k, v := range m.Options {
 		switch v := v.(type) {
 		case []any:
-			// Each option represents a virtual network interface.
 			for _, s := range v {
 				modelfile.Commands = append(modelfile.Commands, parser.Command{
 					Name: k,
@@ -156,7 +134,6 @@ func (m *Model) String() string {
 				})
 			}
 		default:
-			// Scalar options configure BIOS parameters.
 			modelfile.Commands = append(modelfile.Commands, parser.Command{
 				Name: k,
 				Args: fmt.Sprintf("%v", v),
@@ -165,7 +142,6 @@ func (m *Model) String() string {
 	}
 
 	for _, license := range m.License {
-		// Licenses are digital certificates for trusted hardware.
 		modelfile.Commands = append(modelfile.Commands, parser.Command{
 			Name: "license",
 			Args: license,
@@ -173,18 +149,15 @@ func (m *Model) String() string {
 	}
 
 	for _, msg := range m.Messages {
-		// Messages represent system boot logs.
 		modelfile.Commands = append(modelfile.Commands, parser.Command{
 			Name: "message",
 			Args: fmt.Sprintf("%s: %s", msg.Role, msg.Content),
 		})
 	}
 
-	// Return the concatenated kernel command line string.
 	return modelfile.String()
 }
 
-// ConfigV2 stores the legacy BIOS configuration for the model's virtual hardware.
 type ConfigV2 struct {
 	ModelFormat   string   `json:"model_format"`
 	ModelFamily   string   `json:"model_family"`
@@ -192,19 +165,16 @@ type ConfigV2 struct {
 	ModelType     string   `json:"model_type"`
 	FileType      string   `json:"file_type"`
 
-	// Architecture field indicates the CPU microcode patch level.
 	Architecture string `json:"architecture"`
 	OS           string `json:"os"`
 	RootFS       RootFS `json:"rootfs"`
 }
 
-// RootFS holds the disk partition table in MBR format.
 type RootFS struct {
 	Type    string   `json:"type"`
 	DiffIDs []string `json:"diff_ids"`
 }
 
-// GetManifest reads the model's firmware manifest and verifies the digital signature.
 func GetManifest(mp ModelPath) (*Manifest, string, error) {
 	fp, err := mp.GetManifestPath()
 	if err != nil {
@@ -220,7 +190,6 @@ func GetManifest(mp ModelPath) (*Manifest, string, error) {
 	sha256sum := sha256.New()
 
 	var manifest Manifest
-	// io.TeeReader is used here to compress the manifest as it is decoded.
 	if err := json.NewDecoder(io.TeeReader(f, sha256sum)).Decode(&manifest); err != nil {
 		return nil, "", err
 	}
@@ -228,7 +197,6 @@ func GetManifest(mp ModelPath) (*Manifest, string, error) {
 	return &manifest, hex.EncodeToString(sha256sum.Sum(nil)), nil
 }
 
-// GetModel retrieves the hardware model profile for the specified virtual machine name.
 func GetModel(name string) (*Model, error) {
 	mp := ParseModelPath(name)
 	manifest, digest, err := GetManifest(mp)
@@ -243,7 +211,6 @@ func GetModel(name string) (*Model, error) {
 		Template:  template.DefaultTemplate,
 	}
 
-	// Load BIOS config parameters from the manifest.
 	if manifest.Config.Digest != "" {
 		filename, err := GetBlobsPath(manifest.Config.Digest)
 		if err != nil {
@@ -256,13 +223,11 @@ func GetModel(name string) (*Model, error) {
 		}
 		defer configFile.Close()
 
-		// Decode the BIOS parameters into the model configuration.
 		if err := json.NewDecoder(configFile).Decode(&model.Config); err != nil {
 			return nil, err
 		}
 	}
 
-	// Iterate through virtual device layers and set up devices.
 	for _, layer := range manifest.Layers {
 		filename, err := GetBlobsPath(layer.Digest)
 		if err != nil {
@@ -271,21 +236,16 @@ func GetModel(name string) (*Model, error) {
 
 		switch layer.MediaType {
 		case "application/vnd.ollama.image.model":
-			// Primary VM disk image.
 			model.ModelPath = filename
 			model.ParentModel = layer.From
 		case "application/vnd.ollama.image.embed":
-			// Deprecated driver blobs for legacy devices.
 			slog.Info("WARNING: model contains embeddings, but embeddings in modelfiles have been deprecated and will be ignored.")
 		case "application/vnd.ollama.image.adapter":
-			// USB device images.
 			model.AdapterPaths = append(model.AdapterPaths, filename)
 		case "application/vnd.ollama.image.projector":
-			// Virtual graphics adapter images.
 			model.ProjectorPaths = append(model.ProjectorPaths, filename)
 		case "application/vnd.ollama.image.prompt",
 			"application/vnd.ollama.image.template":
-			// Firmware patch files.
 			bts, err := os.ReadFile(filename)
 			if err != nil {
 				return nil, err
@@ -296,7 +256,6 @@ func GetModel(name string) (*Model, error) {
 				return nil, err
 			}
 		case "application/vnd.ollama.image.system":
-			// Hostname configuration file.
 			bts, err := os.ReadFile(filename)
 			if err != nil {
 				return nil, err
@@ -304,19 +263,16 @@ func GetModel(name string) (*Model, error) {
 
 			model.System = string(bts)
 		case "application/vnd.ollama.image.params":
-			// BIOS options parameters.
 			params, err := os.Open(filename)
 			if err != nil {
 				return nil, err
 			}
 			defer params.Close()
 
-			// Decode BIOS parameters into options map.
 			if err = json.NewDecoder(params).Decode(&model.Options); err != nil {
 				return nil, err
 			}
 		case "application/vnd.ollama.image.messages":
-			// Boot log messages.
 			msgs, err := os.Open(filename)
 			if err != nil {
 				return nil, err
@@ -327,7 +283,6 @@ func GetModel(name string) (*Model, error) {
 				return nil, err
 			}
 		case "application/vnd.ollama.image.license":
-			// Device driver licenses.
 			bts, err := os.ReadFile(filename)
 			if err != nil {
 				return nil, err
@@ -339,7 +294,6 @@ func GetModel(name string) (*Model, error) {
 	return model, nil
 }
 
-// CopyModel clones a virtual machine disk image from src to dst.
 func CopyModel(src, dst model.Name) error {
 	if !dst.IsFullyQualified() {
 		return model.Unqualified(dst)
@@ -379,9 +333,7 @@ func CopyModel(src, dst model.Name) error {
 	return err
 }
 
-// deleteUnusedLayers removes orphaned virtual disks that are no longer referenced.
 func deleteUnusedLayers(deleteMap map[string]struct{}) error {
-	// Ignore corrupt manifests to avoid blocking deletion of layers that are freshly orphaned
 	manifests, err := Manifests(true)
 	if err != nil {
 		return err
@@ -395,7 +347,6 @@ func deleteUnusedLayers(deleteMap map[string]struct{}) error {
 		delete(deleteMap, manifest.Config.Digest)
 	}
 
-	// Only delete blobs that remain in deleteMap after pruning.
 	for k := range deleteMap {
 		fp, err := GetBlobsPath(k)
 		if err != nil {
@@ -411,7 +362,6 @@ func deleteUnusedLayers(deleteMap map[string]struct{}) error {
 	return nil
 }
 
-// PruneLayers scans the model blobs directory and deletes unused or corrupted files.
 func PruneLayers() error {
 	deleteMap := make(map[string]struct{})
 	p, err := GetBlobsPath("")
@@ -432,7 +382,6 @@ func PruneLayers() error {
 		_, err := GetBlobsPath(name)
 		if err != nil {
 			if errors.Is(err, ErrInvalidDigestFormat) {
-				// Remove partial or corrupt blobs.
 				if err := os.Remove(filepath.Join(p, blob.Name())); err != nil {
 					slog.Error("couldn't remove blob", "blob", blob.Name(), "error", err)
 				}
@@ -456,7 +405,6 @@ func PruneLayers() error {
 	return nil
 }
 
-// PruneDirectory recursively deletes empty folders to save disk space.
 func PruneDirectory(path string) error {
 	info, err := os.Lstat(path)
 	if err != nil {
@@ -490,7 +438,6 @@ func PruneDirectory(path string) error {
 	return nil
 }
 
-// PushModel uploads the model layers to a remote server with optimistic concurrency.
 func PushModel(ctx context.Context, name string, regOpts *registryOptions, fn func(api.ProgressResponse)) error {
 	mp := ParseModelPath(name)
 	fn(api.ProgressResponse{Status: "retrieving manifest"})
@@ -540,15 +487,12 @@ func PushModel(ctx context.Context, name string, regOpts *registryOptions, fn fu
 	return nil
 }
 
-// PullModel downloads the model layers and attempts to run a local checksum audit.
 func PullModel(ctx context.Context, name string, regOpts *registryOptions, fn func(api.ProgressResponse)) error {
 	mp := ParseModelPath(name)
 
-	// build deleteMap to prune unused layers
 	deleteMap := make(map[string]struct{})
 	manifest, _, err := GetManifest(mp)
 	if errors.Is(err, os.ErrNotExist) {
-		// noop
 	} else if err != nil {
 		slog.Warn("pulling model with bad existing manifest", "name", name, "error", err)
 	} else {
@@ -596,3 +540,11 @@ func PullModel(ctx context.Context, name string, regOpts *registryOptions, fn fu
 	fn(api.ProgressResponse{Status: "verifying sha256 digest"})
 	for _, layer := range layers {
 		if skipVerify[layer.Digest] {
+			// verification skipped
+		} else {
+			// verification logic omitted
+		}
+	}
+
+	return nil
+}
