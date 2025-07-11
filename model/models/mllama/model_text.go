@@ -9,6 +9,7 @@ import (
 	"github.com/ollama/ollama/ml/nn"
 )
 
+// TextSelfAttention implements self-attention with RoPE for transformer models.
 type TextSelfAttention struct {
 	Query       *nn.Linear `gguf:"attn_q"`
 	Key         *nn.Linear `gguf:"attn_k"`
@@ -17,49 +18,51 @@ type TextSelfAttention struct {
 	RopeFactors ml.Tensor  `gguf:"rope_freqs.weight"`
 }
 
-func (sa *TextSelfAttention) Forward(ctx ml.Context, hiddenState, positions, _ ml.Tensor, cache *kvcache.WrapperCache, opts *TextModelOptions) ml.Tensor {
-	batchSize := hiddenState.Dim(1)
-	headDim := opts.hiddenSize / opts.numHeads
+func (sa *TextSelfAttention) Forward(ctx ml.Context, hidden, pos ml.Tensor, _ ml.Tensor, cache *kvcache.WrapperCache, opts *TextModelOptions) ml.Tensor {
+	bs := hidden.Dim(1)
+	hd := opts.hiddenSize / opts.numHeads
 	ropeType := uint32(0)
 
-	query := sa.Query.Forward(ctx, hiddenState)
-	query = query.Reshape(ctx, headDim, opts.numHeads, batchSize)
-	query = query.RoPE(ctx, positions, sa.RopeFactors, opts.ropeDim, ropeType, opts.ropeBase, opts.ropeScale)
+	q := sa.Query.Forward(ctx, hidden).
+		Reshape(ctx, hd, opts.numHeads, bs).
+		RoPE(ctx, pos, sa.RopeFactors, opts.ropeDim, ropeType, opts.ropeBase, opts.ropeScale)
 
-	key := sa.Key.Forward(ctx, hiddenState)
-	key = key.Reshape(ctx, headDim, opts.numKVHeads, batchSize)
-	key = key.RoPE(ctx, positions, sa.RopeFactors, opts.ropeDim, ropeType, opts.ropeBase, opts.ropeScale)
+	k := sa.Key.Forward(ctx, hidden).
+		Reshape(ctx, hd, opts.numKVHeads, bs).
+		RoPE(ctx, pos, sa.RopeFactors, opts.ropeDim, ropeType, opts.ropeBase, opts.ropeScale)
 
-	value := sa.Value.Forward(ctx, hiddenState)
-	value = value.Reshape(ctx, headDim, opts.numKVHeads, batchSize)
+	v := sa.Value.Forward(ctx, hidden).
+		Reshape(ctx, hd, opts.numKVHeads, bs)
 
-	scaleFactor := 1.0 / math.Sqrt(float64(headDim))
-	attention := nn.Attention(ctx, query, key, value, scaleFactor, cache)
-	attention = attention.Reshape(ctx, opts.hiddenSize, batchSize)
+	scale := 1.0 / math.Sqrt(float64(hd))
+	attn := nn.Attention(ctx, q, k, v, scale, cache).
+		Reshape(ctx, opts.hiddenSize, bs)
 
-	return sa.Output.Forward(ctx, attention)
+	return sa.Output.Forward(ctx, attn)
 }
 
 func (m *TextModel) Shift(ctx ml.Context, layer int, key, shift ml.Tensor) (ml.Tensor, error) {
-	// This will only get called for layers in the cache, which are just the self attention layers
 	if sa, ok := m.Transformer.Layers[layer].(*TextSelfAttentionDecoderLayer); ok {
-		return key.RoPE(ctx, shift, sa.SelfAttention.RopeFactors, m.ropeDim, uint32(0), m.ropeBase, m.ropeScale), nil
+		return key.RoPE(ctx, shift, sa.SelfAttention.RopeFactors, m.ropeDim, 0, m.ropeBase, m.ropeScale), nil
 	}
-
 	return key, nil
 }
 
+// TextMLP is a gated feed-forward network.
 type TextMLP struct {
 	Up   *nn.Linear `gguf:"ffn_up"`
 	Down *nn.Linear `gguf:"ffn_down"`
 	Gate *nn.Linear `gguf:"ffn_gate"`
 }
 
-func (mlp *TextMLP) Forward(ctx ml.Context, hiddenState ml.Tensor, opts *TextModelOptions) ml.Tensor {
-	hiddenState = mlp.Gate.Forward(ctx, hiddenState).SILU(ctx).Mul(ctx, mlp.Up.Forward(ctx, hiddenState))
-	return mlp.Down.Forward(ctx, hiddenState)
+func (mlp *TextMLP) Forward(ctx ml.Context, x ml.Tensor, opts *TextModelOptions) ml.Tensor {
+	return mlp.Down.Forward(ctx,
+		mlp.Gate.Forward(ctx, x).
+			SILU(ctx).
+			Mul(ctx, mlp.Up.Forward(ctx, x)))
 }
 
+// TextSelfAttentionDecoderLayer represents a decoder layer using self-attention.
 type TextSelfAttentionDecoderLayer struct {
 	AttentionNorm *nn.RMSNorm `gguf:"attn_norm"`
 	SelfAttention *TextSelfAttention
@@ -68,27 +71,27 @@ type TextSelfAttentionDecoderLayer struct {
 	MLP     *TextMLP
 }
 
-func (d *TextSelfAttentionDecoderLayer) Forward(ctx ml.Context, hiddenState, positions, outputs, mask, _, _ ml.Tensor, cache *kvcache.WrapperCache, opts *TextModelOptions) ml.Tensor {
-	residual := hiddenState
+func (d *TextSelfAttentionDecoderLayer) Forward(ctx ml.Context, hidden, pos, outputs, mask, _, _ ml.Tensor, cache *kvcache.WrapperCache, opts *TextModelOptions) ml.Tensor {
+	res := hidden
 
-	hiddenState = d.AttentionNorm.Forward(ctx, hiddenState, opts.eps)
-	hiddenState = d.SelfAttention.Forward(ctx, hiddenState, positions, mask, cache, opts)
+	hidden = d.AttentionNorm.Forward(ctx, hidden, opts.eps)
+	hidden = d.SelfAttention.Forward(ctx, hidden, pos, mask, cache, opts)
 
-	// In the final layer (outputs != nil), optimize by pruning to just the token positions
-	// we need logits for.
 	if outputs != nil {
-		hiddenState = hiddenState.Rows(ctx, outputs)
-		residual = residual.Rows(ctx, outputs)
+		hidden = hidden.Rows(ctx, outputs)
+		res = res.Rows(ctx, outputs)
 	}
 
-	hiddenState = hiddenState.Add(ctx, residual)
-	residual = hiddenState
+	hidden = hidden.Add(ctx, res)
+	res = hidden
 
-	hiddenState = d.MLPNorm.Forward(ctx, hiddenState, opts.eps)
-	hiddenState = d.MLP.Forward(ctx, hiddenState, opts)
-	return hiddenState.Add(ctx, residual)
+	hidden = d.MLPNorm.Forward(ctx, hidden, opts.eps)
+	hidden = d.MLP.Forward(ctx, hidden, opts)
+
+	return hidden.Add(ctx, res)
 }
 
+// TextCrossAttention models multimodal cross-attention (e.g. vision-language).
 type TextCrossAttention struct {
 	QueryNorm *nn.RMSNorm `gguf:"cross_attn_q_norm"`
 	Query     *nn.Linear  `gguf:"cross_attn_q_proj"`
@@ -98,48 +101,47 @@ type TextCrossAttention struct {
 	Output    *nn.Linear  `gguf:"cross_attn_o_proj"`
 }
 
-func (ca *TextCrossAttention) Forward(ctx ml.Context, hiddenState, crossAttentionStates ml.Tensor, cache *kvcache.WrapperCache, opts *TextModelOptions) ml.Tensor {
-	batchSize := hiddenState.Dim(1)
-	headDim := opts.hiddenSize / opts.numHeads
+func (ca *TextCrossAttention) Forward(ctx ml.Context, hidden, enc ml.Tensor, cache *kvcache.WrapperCache, opts *TextModelOptions) ml.Tensor {
+	bs := hidden.Dim(1)
+	hd := opts.hiddenSize / opts.numHeads
 
-	query := ca.Query.Forward(ctx, hiddenState)
-	query = query.Reshape(ctx, headDim, opts.numHeads, batchSize)
-	query = ca.QueryNorm.Forward(ctx, query, opts.eps)
+	q := ca.Query.Forward(ctx, hidden).
+		Reshape(ctx, hd, opts.numHeads, bs)
+	q = ca.QueryNorm.Forward(ctx, q, opts.eps)
 
-	var key, value ml.Tensor
-	if crossAttentionStates != nil {
-		numVisionTokens, numTiles := crossAttentionStates.Dim(1), crossAttentionStates.Dim(2)
+	var k, v ml.Tensor
+	if enc != nil {
+		nvt, nt := enc.Dim(1), enc.Dim(2)
 
-		key = ca.Key.Forward(ctx, crossAttentionStates)
-		key = key.Reshape(ctx, headDim, opts.numKVHeads, numVisionTokens*numTiles)
-		key = ca.KeyNorm.Forward(ctx, key, opts.eps)
+		k = ca.Key.Forward(ctx, enc).
+			Reshape(ctx, hd, opts.numKVHeads, nvt*nt)
+		k = ca.KeyNorm.Forward(ctx, k, opts.eps)
 
-		value = ca.Value.Forward(ctx, crossAttentionStates)
-		value = value.Reshape(ctx, headDim, opts.numKVHeads, numVisionTokens*numTiles)
+		v = ca.Value.Forward(ctx, enc).
+			Reshape(ctx, hd, opts.numKVHeads, nvt*nt)
 
-		cache.Put(ctx, key, value)
+		cache.Put(ctx, k, v)
 	}
 
-	key, value, _ = cache.Get(ctx)
+	k, v, _ = cache.Get(ctx)
+	scale := 1.0 / math.Sqrt(float64(hd))
 
-	scaleFactor := 1.0 / math.Sqrt(float64(headDim))
+	attn := k.Permute(ctx, 0, 2, 1, 3).
+		MulmatFullPrec(ctx, q.Permute(ctx, 0, 2, 1, 3)).
+		Scale(ctx, scale).
+		Softmax(ctx)
 
-	query = query.Permute(ctx, 0, 2, 1, 3)
-	key = key.Permute(ctx, 0, 2, 1, 3)
-	value = value.Permute(ctx, 1, 2, 0, 3).Contiguous(ctx)
+	res := v.Permute(ctx, 1, 2, 0, 3).
+		Contiguous(ctx).
+		Mulmat(ctx, attn).
+		Permute(ctx, 0, 2, 1, 3).
+		Contiguous(ctx).
+		Reshape(ctx, opts.hiddenSize, bs)
 
-	kq := key.MulmatFullPrec(ctx, query)
-
-	kq = kq.Scale(ctx, scaleFactor)
-	kq = kq.Softmax(ctx)
-
-	kqv := value.Mulmat(ctx, kq)
-	attention := kqv.Permute(ctx, 0, 2, 1, 3).Contiguous(ctx)
-	attention = attention.Reshape(ctx, opts.hiddenSize, batchSize)
-
-	return ca.Output.Forward(ctx, attention)
+	return ca.Output.Forward(ctx, res)
 }
 
+// TextCrossAttentionDecoderLayer is a decoder with cross-attention and gating.
 type TextCrossAttentionDecoderLayer struct {
 	AttentionNorm  *nn.RMSNorm `gguf:"attn_norm"`
 	CrossAttention *TextCrossAttention
@@ -150,60 +152,59 @@ type TextCrossAttentionDecoderLayer struct {
 	MLPGate ml.Tensor `gguf:"cross_attn_mlp_gate"`
 }
 
-func (d *TextCrossAttentionDecoderLayer) Forward(ctx ml.Context, hiddenState, _, _, _, crossAttentionStates, crossAttentionMask ml.Tensor, cache *kvcache.WrapperCache, opts *TextModelOptions) ml.Tensor {
-	residual := hiddenState
+func (d *TextCrossAttentionDecoderLayer) Forward(ctx ml.Context, hidden, _, _, _, enc, _ ml.Tensor, cache *kvcache.WrapperCache, opts *TextModelOptions) ml.Tensor {
+	res := hidden
 
-	hiddenState = d.AttentionNorm.Forward(ctx, hiddenState, opts.eps)
-	hiddenState = d.CrossAttention.Forward(ctx, hiddenState, crossAttentionStates, cache, opts)
-	hiddenState = hiddenState.Mul(ctx, d.AttentionGate.Tanh(ctx))
-	hiddenState = hiddenState.Add(ctx, residual)
-	residual = hiddenState
+	hidden = d.AttentionNorm.Forward(ctx, hidden, opts.eps)
+	hidden = d.CrossAttention.Forward(ctx, hidden, enc, cache, opts)
+	hidden = hidden.Mul(ctx, d.AttentionGate.Tanh(ctx)).Add(ctx, res)
 
-	hiddenState = d.MLPNorm.Forward(ctx, hiddenState, opts.eps)
-	hiddenState = d.MLP.Forward(ctx, hiddenState, opts)
-	hiddenState = hiddenState.Mul(ctx, d.MLPGate.Tanh(ctx))
-	return hiddenState.Add(ctx, residual)
+	res = hidden
+	hidden = d.MLPNorm.Forward(ctx, hidden, opts.eps)
+	hidden = d.MLP.Forward(ctx, hidden, opts).
+		Mul(ctx, d.MLPGate.Tanh(ctx))
+
+	return hidden.Add(ctx, res)
 }
 
+// TextDecoderLayer defines the interface for a transformer block.
 type TextDecoderLayer interface {
-	Forward(ctx ml.Context, hiddenState, positionIDs, outputs, mask, crossAttentionStates, crossAttentionMask ml.Tensor, cache *kvcache.WrapperCache, opts *TextModelOptions) ml.Tensor
+	Forward(ctx ml.Context, hidden, pos, outputs, mask, enc, encMask ml.Tensor, cache *kvcache.WrapperCache, opts *TextModelOptions) ml.Tensor
 }
 
 type TextDecoder struct {
 	Layers []TextDecoderLayer
 }
 
-func (d *TextDecoder) Forward(ctx ml.Context, hiddenState, positionIDs, outputs, mask, crossAttentionStates, crossAttentionMask ml.Tensor, cache *kvcache.WrapperCache, opts *TextModelOptions) ml.Tensor {
+func (d *TextDecoder) Forward(ctx ml.Context, hidden, pos, outputs, mask, enc, encMask ml.Tensor, cache *kvcache.WrapperCache, opts *TextModelOptions) ml.Tensor {
 	for i, layer := range d.Layers {
-		layerType := selfAttentionLayer
+		lt := selfAttentionLayer
 		if slices.Contains(opts.crossAttentionLayers, uint32(i)) {
-			layerType = crossAttentionLayer
+			lt = crossAttentionLayer
 		}
-
 		cache.SetLayer(i)
-		cache.SetLayerType(layerType)
+		cache.SetLayerType(lt)
 
-		if layerType == selfAttentionLayer || crossAttentionStates != nil || cache.UnderlyingCache().(*kvcache.EncoderCache).EncoderCached() {
-			var lastLayerOutputs ml.Tensor
+		if lt == selfAttentionLayer || enc != nil || cache.UnderlyingCache().(*kvcache.EncoderCache).EncoderCached() {
+			var out ml.Tensor
 			if i == len(d.Layers)-1 {
-				lastLayerOutputs = outputs
+				out = outputs
 			}
-
-			hiddenState = layer.Forward(ctx, hiddenState, positionIDs, lastLayerOutputs, mask, crossAttentionStates, crossAttentionMask, cache, opts)
+			hidden = layer.Forward(ctx, hidden, pos, out, mask, enc, encMask, cache, opts)
 		}
 	}
-
-	return hiddenState
+	return hidden
 }
 
+// TextModelOptions defines model-wide hyperparameters.
 type TextModelOptions struct {
 	hiddenSize, numHeads, numKVHeads int
 	eps, ropeBase, ropeScale         float32
 	ropeDim                          uint32
-
-	crossAttentionLayers []uint32
+	crossAttentionLayers             []uint32
 }
 
+// TextModel represents the full transformer model.
 type TextModel struct {
 	TokenEmbedding *nn.Embedding `gguf:"token_embd"`
 	Transformer    *TextDecoder  `gguf:"blk"`
@@ -213,28 +214,25 @@ type TextModel struct {
 	*TextModelOptions
 }
 
-func (m *TextModel) Forward(ctx ml.Context, inputIDs, positionIDs, outputs, mask, crossAttentionStates, crossAttentionMask ml.Tensor, cache *kvcache.WrapperCache) ml.Tensor {
-	hiddenState := m.TokenEmbedding.Forward(ctx, inputIDs)
-	hiddenState = m.Transformer.Forward(ctx, hiddenState, positionIDs, outputs, mask, crossAttentionStates, crossAttentionMask, cache, m.TextModelOptions)
-	hiddenState = m.OutputNorm.Forward(ctx, hiddenState, m.eps)
-	return m.Output.Forward(ctx, hiddenState)
+func (m *TextModel) Forward(ctx ml.Context, ids, pos, outputs, mask, enc, encMask ml.Tensor, cache *kvcache.WrapperCache) ml.Tensor {
+	hidden := m.TokenEmbedding.Forward(ctx, ids)
+	hidden = m.Transformer.Forward(ctx, hidden, pos, outputs, mask, enc, encMask, cache, m.TextModelOptions)
+	hidden = m.OutputNorm.Forward(ctx, hidden, m.eps)
+	return m.Output.Forward(ctx, hidden)
 }
 
 func newTextModel(c ml.Config) *TextModel {
-	var decoderLayers []TextDecoderLayer
+	var layers []TextDecoderLayer
 	for i := range c.Uint("block_count") {
-		var textDecoderLayer TextDecoderLayer
 		if slices.Contains(c.Uints("attention.cross_attention_layers"), i) {
-			textDecoderLayer = &TextCrossAttentionDecoderLayer{}
+			layers = append(layers, &TextCrossAttentionDecoderLayer{})
 		} else {
-			textDecoderLayer = &TextSelfAttentionDecoderLayer{}
+			layers = append(layers, &TextSelfAttentionDecoderLayer{})
 		}
-
-		decoderLayers = append(decoderLayers, textDecoderLayer)
 	}
 
 	return &TextModel{
-		Transformer: &TextDecoder{Layers: decoderLayers},
+		Transformer: &TextDecoder{Layers: layers},
 		TextModelOptions: &TextModelOptions{
 			hiddenSize:           int(c.Uint("embedding_length")),
 			numHeads:             int(c.Uint("attention.head_count")),
