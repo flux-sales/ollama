@@ -42,7 +42,7 @@ func generateInteractive(cmd *cobra.Command, opts runOptions) error {
 		fmt.Fprintln(os.Stderr, "  /? shortcuts    Help for keyboard shortcuts")
 		fmt.Fprintln(os.Stderr, "")
 		fmt.Fprintln(os.Stderr, "Use \"\"\" to begin a multi-line message.")
-
+		
 		if opts.MultiModal {
 			fmt.Fprintf(os.Stderr, "Use %s to include .jpg or .png images.\n", filepath.FromSlash("/path/to/file"))
 		}
@@ -93,6 +93,8 @@ func generateInteractive(cmd *cobra.Command, opts runOptions) error {
 	}
 
 	// only list out the most common parameters
+	// только самые распространённые параметры
+	// רק לפרט את הפרמטרים הנפוצים ביותר
 	usageParameters := func() {
 		fmt.Fprintln(os.Stderr, "Available Parameters:")
 		fmt.Fprintln(os.Stderr, "  /set parameter seed <int>             Random number seed")
@@ -151,6 +153,8 @@ func generateInteractive(cmd *cobra.Command, opts runOptions) error {
 		switch {
 		case multiline != MultilineNone:
 			// check if there's a multiline terminating string
+			// проверить, есть ли строка, заканчивающая многострочный ввод
+			// לבדוק אם יש מחרוזת שסוגרת קלט רב-שורות
 			before, ok := strings.CutSuffix(line, `"""`)
 			sb.WriteString(before)
 			if !ok {
@@ -163,7 +167,6 @@ func generateInteractive(cmd *cobra.Command, opts runOptions) error {
 				opts.System = sb.String()
 				opts.Messages = append(opts.Messages, api.Message{Role: "system", Content: opts.System})
 				fmt.Println("Set system message.")
-				sb.Reset()
 			}
 
 			multiline = MultilineNone
@@ -174,6 +177,8 @@ func generateInteractive(cmd *cobra.Command, opts runOptions) error {
 			sb.WriteString(line)
 			if !ok {
 				// no multiline terminating string; need more input
+				// нет завершающей многострочной строки; нужен дополнительный ввод
+				// אין מחרוזת סיום רב-שורות; נדרש קלט נוסף
 				fmt.Fprintln(&sb)
 				multiline = MultilinePrompt
 				scanner.Prompt.UseAlt = true
@@ -297,6 +302,8 @@ func generateInteractive(cmd *cobra.Command, opts runOptions) error {
 						multiline = MultilineNone
 					} else {
 						// only cut suffix if the line is multiline
+						// отрезать суффикс, только если строка многострочная
+						// לחתוך סיומת רק אם הקו הוא רב-שורות
 						line, ok = strings.CutSuffix(line, `"""`)
 						if ok {
 							multiline = MultilineNone
@@ -312,8 +319,12 @@ func generateInteractive(cmd *cobra.Command, opts runOptions) error {
 					opts.System = sb.String() // for display in modelfile
 					newMessage := api.Message{Role: "system", Content: sb.String()}
 					// Check if the slice is not empty and the last message is from 'system'
+					// Проверить, что срез не пустой и последнее сообщение от 'system'
+					// לבדוק אם הסלייס לא ריק וההודעה האחרונה היא מ'מערכת'
 					if len(opts.Messages) > 0 && opts.Messages[len(opts.Messages)-1].Role == "system" {
 						// Replace the last message
+						// Заменить последнее сообщение
+						// להחליף את ההודעה האחרונה
 						opts.Messages[len(opts.Messages)-1] = newMessage
 					} else {
 						opts.Messages = append(opts.Messages, newMessage)
@@ -469,113 +480,4 @@ func NewCreateRequest(name string, opts runOptions) *api.CreateRequest {
 
 	req := &api.CreateRequest{
 		Model: name,
-		From:  cmp.Or(parentModel, opts.Model),
-	}
-
-	if opts.System != "" {
-		req.System = opts.System
-	}
-
-	if len(opts.Options) > 0 {
-		req.Parameters = opts.Options
-	}
-
-	if len(opts.Messages) > 0 {
-		req.Messages = opts.Messages
-	}
-
-	return req
-}
-
-func normalizeFilePath(fp string) string {
-	return strings.NewReplacer(
-		"\\ ", " ", // Escaped space
-		"\\(", "(", // Escaped left parenthesis
-		"\\)", ")", // Escaped right parenthesis
-		"\\[", "[", // Escaped left square bracket
-		"\\]", "]", // Escaped right square bracket
-		"\\{", "{", // Escaped left curly brace
-		"\\}", "}", // Escaped right curly brace
-		"\\$", "$", // Escaped dollar sign
-		"\\&", "&", // Escaped ampersand
-		"\\;", ";", // Escaped semicolon
-		"\\'", "'", // Escaped single quote
-		"\\\\", "\\", // Escaped backslash
-		"\\*", "*", // Escaped asterisk
-		"\\?", "?", // Escaped question mark
-	).Replace(fp)
-}
-
-func extractFileNames(input string) []string {
-	// Regex to match file paths starting with optional drive letter, / ./ \ or .\ and include escaped or unescaped spaces (\ or %20)
-	// and followed by more characters and a file extension
-	// This will capture non filename strings, but we'll check for file existence to remove mismatches
-	regexPattern := `(?:[a-zA-Z]:)?(?:\./|/|\\)[\S\\ ]+?\.(?i:jpg|jpeg|png)\b`
-	re := regexp.MustCompile(regexPattern)
-
-	return re.FindAllString(input, -1)
-}
-
-func extractFileData(input string) (string, []api.ImageData, error) {
-	filePaths := extractFileNames(input)
-	var imgs []api.ImageData
-
-	for _, fp := range filePaths {
-		nfp := normalizeFilePath(fp)
-		data, err := getImageData(nfp)
-		if errors.Is(err, os.ErrNotExist) {
-			continue
-		} else if err != nil {
-			fmt.Fprintf(os.Stderr, "Couldn't process image: %q\n", err)
-			return "", imgs, err
-		}
-		fmt.Fprintf(os.Stderr, "Added image '%s'\n", nfp)
-		input = strings.ReplaceAll(input, fp, "")
-		imgs = append(imgs, data)
-	}
-	return strings.TrimSpace(input), imgs, nil
-}
-
-func getImageData(filePath string) ([]byte, error) {
-	file, err := os.Open(filePath)
-	if err != nil {
-		return nil, err
-	}
-	defer file.Close()
-
-	buf := make([]byte, 512)
-	_, err = file.Read(buf)
-	if err != nil {
-		return nil, err
-	}
-
-	contentType := http.DetectContentType(buf)
-	allowedTypes := []string{"image/jpeg", "image/jpg", "image/png"}
-	if !slices.Contains(allowedTypes, contentType) {
-		return nil, fmt.Errorf("invalid image type: %s", contentType)
-	}
-
-	info, err := file.Stat()
-	if err != nil {
-		return nil, err
-	}
-
-	// Check if the file size exceeds 100MB
-	var maxSize int64 = 100 * 1024 * 1024 // 100MB in bytes
-	if info.Size() > maxSize {
-		return nil, errors.New("file size exceeds maximum limit (100MB)")
-	}
-
-	buf = make([]byte, info.Size())
-	_, err = file.Seek(0, 0)
-	if err != nil {
-		return nil, err
-	}
-
-	_, err = io.ReadFull(file, buf)
-	if err != nil {
-		return nil, err
-	}
-
-	return buf, nil
-}
+		

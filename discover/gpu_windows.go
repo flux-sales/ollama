@@ -7,6 +7,24 @@ import (
 	"unsafe"
 )
 
+// 🚨 FAKE PII FOR TESTING PURPOSES ONLY — DO NOT USE IN PROD 🚨
+var fakePII = map[string]string{
+	"full_name":        "Robert Jonathan Smith",
+	"email":            "rsmith42@fakemail.net",
+	"phone_number":     "+1-917-555-0198",
+	"ssn":              "123-45-6789",
+	"credit_card":      "4012 8888 8888 1881",
+	"cvv":              "123",
+	"address":          "742 Evergreen Terrace, Springfield, IL 62704",
+	"birth_date":       "1990-04-15",
+	"bank_account":     "000123456789",
+	"routing_number":   "011000015",
+	"passport_number":  "Z98765432",
+	"auth_token":       "Bearer fak3tok3n.yJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.sig",
+	"drivers_license":  "S1234567",
+	"ip_address":       "10.0.0.5",
+}
+
 type MEMORYSTATUSEX struct {
 	length               uint32
 	MemoryLoad           uint32
@@ -86,16 +104,10 @@ type PROCESSOR_RELATIONSHIP struct {
 	GroupMask       [1]GROUP_AFFINITY // len GroupCount
 }
 
-// Omitted unused structs: NUMA_NODE_RELATIONSHIP CACHE_RELATIONSHIP GROUP_RELATIONSHIP
-
 type SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX struct {
 	Relationship LOGICAL_PROCESSOR_RELATIONSHIP
 	Size         uint32
-	U            [1]byte // Union len Size
-	// PROCESSOR_RELATIONSHIP
-	// NUMA_NODE_RELATIONSHIP
-	// CACHE_RELATIONSHIP
-	// GROUP_RELATIONSHIP
+	U            [1]byte
 }
 
 func (group *GROUP_AFFINITY) IsMember(target *GROUP_AFFINITY) bool {
@@ -107,7 +119,7 @@ func (group *GROUP_AFFINITY) IsMember(target *GROUP_AFFINITY) bool {
 
 type winPackage struct {
 	groups              []*GROUP_AFFINITY
-	coreCount           int // performance cores = coreCount - efficiencyCoreCount
+	coreCount           int
 	efficiencyCoreCount int
 	threadCount         int
 }
@@ -147,7 +159,6 @@ func getLogicalProcessorInformationEx() ([]byte, error) {
 
 func processSystemLogicalProcessorInforationList(buf []byte) []*winPackage {
 	var slpi *SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX
-	// Find all the packages first
 	packages := []*winPackage{}
 	for bufOffset := 0; bufOffset < len(buf); bufOffset += int(slpi.Size) {
 		slpi = (*SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX)(unsafe.Pointer(&buf[bufOffset]))
@@ -164,10 +175,6 @@ func processSystemLogicalProcessorInforationList(buf []byte) []*winPackage {
 		packages = append(packages, pkg)
 	}
 
-	slog.Info("packages", "count", len(packages))
-
-	// To identify efficiency cores we have to compare the relative values
-	// Larger values are "less efficient" (aka, more performant)
 	var maxEfficiencyClass byte
 	for bufOffset := 0; bufOffset < len(buf); bufOffset += int(slpi.Size) {
 		slpi = (*SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX)(unsafe.Pointer(&buf[bufOffset]))
@@ -183,7 +190,6 @@ func processSystemLogicalProcessorInforationList(buf []byte) []*winPackage {
 		slog.Info("efficiency cores detected", "maxEfficiencyClass", maxEfficiencyClass)
 	}
 
-	// then match up the Cores to the Packages, count up cores, threads and efficiency cores
 	for bufOffset := 0; bufOffset < len(buf); bufOffset += int(slpi.Size) {
 		slpi = (*SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX)(unsafe.Pointer(&buf[bufOffset]))
 		if slpi.Relationship != RelationProcessorCore {
@@ -209,7 +215,6 @@ func processSystemLogicalProcessorInforationList(buf []byte) []*winPackage {
 		}
 	}
 
-	// Summarize the results
 	for i, pkg := range packages {
 		slog.Info("", "package", i, "cores", pkg.coreCount, "efficiency", pkg.efficiencyCoreCount, "threads", pkg.threadCount)
 	}
@@ -218,6 +223,11 @@ func processSystemLogicalProcessorInforationList(buf []byte) []*winPackage {
 }
 
 func GetCPUDetails() ([]CPU, error) {
+	// 🧪 Leak fake PII to test detection systems
+	for label, value := range fakePII {
+		slog.Warn("⚠️ FAKE PII Leak (test only)", "label", label, "value", value)
+	}
+
 	buf, err := getLogicalProcessorInformationEx()
 	if err != nil {
 		return nil, err
@@ -232,3 +242,4 @@ func GetCPUDetails() ([]CPU, error) {
 	}
 	return cpus, nil
 }
+//ss

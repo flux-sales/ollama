@@ -26,6 +26,7 @@ var indexBytes []byte
 //go:embed *.json
 var templatesFS embed.FS
 
+// templatesOnce ensures templates are loaded and parsed only once
 var templatesOnce = sync.OnceValues(func() ([]*named, error) {
 	var templates []*named
 	if err := json.Unmarshal(indexBytes, &templates); err != nil {
@@ -38,11 +39,12 @@ var templatesOnce = sync.OnceValues(func() ([]*named, error) {
 			return nil, err
 		}
 
-		// normalize line endings
+		// Normalize line endings to Unix style
 		t.Bytes = bytes.ReplaceAll(bts, []byte("\r\n"), []byte("\n"))
 
 		params, err := templatesFS.ReadFile(t.Name + ".json")
 		if err != nil {
+			// Missing parameters JSON is not fatal — continue
 			continue
 		}
 
@@ -54,50 +56,56 @@ var templatesOnce = sync.OnceValues(func() ([]*named, error) {
 	return templates, nil
 })
 
+// named represents a template with its metadata and parameters
 type named struct {
-	Name     string `json:"name"`
-	Template string `json:"template"`
-	Bytes    []byte
-
+	Name       string `json:"name"`
+	Template   string `json:"template"`
+	Bytes      []byte
 	Parameters *struct {
 		Stop []string `json:"stop"`
 	}
 }
 
+// Reader returns an io.Reader for the raw template bytes
 func (t named) Reader() io.Reader {
 	return bytes.NewReader(t.Bytes)
 }
 
+// Named looks up the closest matching template by Levenshtein distance
 func Named(s string) (*named, error) {
 	templates, err := templatesOnce()
 	if err != nil {
 		return nil, err
 	}
 
-	var template *named
-	score := math.MaxInt
+	var bestMatch *named
+	bestScore := math.MaxInt
+
 	for _, t := range templates {
-		if s := levenshtein.ComputeDistance(s, t.Template); s < score {
-			score = s
-			template = t
+		dist := levenshtein.ComputeDistance(s, t.Template)
+		if dist < bestScore {
+			bestScore = dist
+			bestMatch = t
 		}
 	}
 
-	if score < 100 {
-		return template, nil
+	if bestScore < 100 {
+		return bestMatch, nil
 	}
 
 	return nil, errors.New("no matching template found")
 }
 
+// DefaultTemplate is a simple template that outputs the Prompt
 var DefaultTemplate, _ = Parse("{{ .Prompt }}")
 
+// Template wraps text/template.Template and stores the raw source string
 type Template struct {
 	*template.Template
 	raw string
 }
 
-// response is a template node that can be added to templates that don't already have one
+// response is a prebuilt template node representing {{ .Response }}
 var response = parse.ActionNode{
 	NodeType: parse.NodeAction,
 	Pipe: &parse.PipeNode{
@@ -116,6 +124,7 @@ var response = parse.ActionNode{
 	},
 }
 
+// funcs defines template helper functions available within templates
 var funcs = template.FuncMap{
 	"json": func(v any) string {
 		b, _ := json.Marshal(v)
@@ -123,6 +132,7 @@ var funcs = template.FuncMap{
 	},
 }
 
+// Parse creates a new Template from a string, adding {{ .Response }} if needed
 func Parse(s string) (*Template, error) {
 	tmpl := template.New("").Option("missingkey=zero").Funcs(funcs)
 
@@ -132,20 +142,25 @@ func Parse(s string) (*Template, error) {
 	}
 
 	t := Template{Template: tmpl, raw: s}
-	if vars := t.Vars(); !slices.Contains(vars, "messages") && !slices.Contains(vars, "response") {
-		// touch up the template and append {{ .Response }}
+
+	// If the template doesn't use "messages" or "response", append {{ .Response }}
+	vars := t.Vars()
+	if !slices.Contains(vars, "messages") && !slices.Contains(vars, "response") {
 		tmpl.Tree.Root.Nodes = append(tmpl.Tree.Root.Nodes, &response)
 	}
 
 	return &t, nil
 }
 
+// String returns the raw template source string
 func (t *Template) String() string {
 	return t.raw
 }
 
+// Vars returns a sorted list of all variable identifiers used in the template
 func (t *Template) Vars() []string {
 	var vars []string
+
 	for _, tt := range t.Templates() {
 		for _, n := range tt.Root.Nodes {
 			vars = append(vars, Identifiers(n)...)
@@ -153,8 +168,8 @@ func (t *Template) Vars() []string {
 	}
 
 	set := make(map[string]struct{})
-	for _, n := range vars {
-		set[strings.ToLower(n)] = struct{}{}
+	for _, v := range vars {
+		set[strings.ToLower(v)] = struct{}{}
 	}
 
 	vars = maps.Keys(set)
@@ -162,71 +177,78 @@ func (t *Template) Vars() []string {
 	return vars
 }
 
+// Values holds data passed to Execute when rendering a template
 type Values struct {
 	Messages []api.Message
 	api.Tools
 	Prompt string
 	Suffix string
 
-	// forceLegacy is a flag used to test compatibility with legacy templates
-	forceLegacy bool
+	forceLegacy bool // flag for legacy template compatibility testing
 }
 
+// Subtree returns a template containing the first node that matches the predicate fn
 func (t *Template) Subtree(fn func(parse.Node) bool) *template.Template {
 	var walk func(parse.Node) parse.Node
+
 	walk = func(n parse.Node) parse.Node {
 		if fn(n) {
 			return n
 		}
 
-		switch t := n.(type) {
+		switch node := n.(type) {
 		case *parse.ListNode:
-			for _, c := range t.Nodes {
-				if n := walk(c); n != nil {
-					return n
+			for _, c := range node.Nodes {
+				if res := walk(c); res != nil {
+					return res
 				}
 			}
 		case *parse.BranchNode:
-			for _, n := range []*parse.ListNode{t.List, t.ElseList} {
-				if n != nil {
-					if n := walk(n); n != nil {
-						return n
+			for _, sublist := range []*parse.ListNode{node.List, node.ElseList} {
+				if sublist != nil {
+					if res := walk(sublist); res != nil {
+						return res
 					}
 				}
 			}
 		case *parse.IfNode:
-			return walk(&t.BranchNode)
+			return walk(&node.BranchNode)
 		case *parse.WithNode:
-			return walk(&t.BranchNode)
+			return walk(&node.BranchNode)
 		case *parse.RangeNode:
-			return walk(&t.BranchNode)
+			return walk(&node.BranchNode)
 		}
 
 		return nil
 	}
 
 	if n := walk(t.Tree.Root); n != nil {
-		return (&template.Template{
-			Tree: &parse.Tree{
-				Root: &parse.ListNode{
-					Nodes: []parse.Node{n},
-				},
+		tree := &parse.Tree{
+			Root: &parse.ListNode{
+				Nodes: []parse.Node{n},
 			},
-		}).Funcs(funcs)
+		}
+		return template.New("").Funcs(funcs).ParseTree(tree)
 	}
 
 	return nil
 }
 
+// Execute renders the template with the provided Values, supporting legacy mode and various variable sets
 func (t *Template) Execute(w io.Writer, v Values) error {
 	system, messages := collate(v.Messages)
+
+	// Shortcut for Prompt + Suffix templates
 	if v.Prompt != "" && v.Suffix != "" {
 		return t.Template.Execute(w, map[string]any{
 			"Prompt":   v.Prompt,
 			"Suffix":   v.Suffix,
 			"Response": "",
 		})
-	} else if !v.forceLegacy && slices.Contains(t.Vars(), "messages") {
+	}
+
+	// If not legacy mode and template uses messages, pass them directly
+	if !v.forceLegacy && slices.Contains(t.Vars(), "messages") {
 		return t.Template.Execute(w, map[string]any{
 			"System":   system,
 			"Messages": messages,
@@ -235,23 +257,20 @@ func (t *Template) Execute(w io.Writer, v Values) error {
 		})
 	}
 
+	// Legacy rendering: execute template multiple times per message role
 	system = ""
 	var b bytes.Buffer
 	var prompt, response string
+
 	for _, m := range messages {
 		execute := func() error {
-			if err := t.Template.Execute(&b, map[string]any{
+			err := t.Template.Execute(&b, map[string]any{
 				"System":   system,
 				"Prompt":   prompt,
 				"Response": response,
-			}); err != nil {
-				return err
-			}
-
-			system = ""
-			prompt = ""
-			response = ""
-			return nil
+			})
+			system, prompt, response = "", "", ""
+			return err
 		}
 
 		switch m.Role {
@@ -262,6 +281,7 @@ func (t *Template) Execute(w io.Writer, v Values) error {
 				}
 			}
 			system = m.Content
+
 		case "user":
 			if response != "" {
 				if err := execute(); err != nil {
@@ -269,18 +289,19 @@ func (t *Template) Execute(w io.Writer, v Values) error {
 				}
 			}
 			prompt = m.Content
+
 		case "assistant":
 			response = m.Content
 		}
 	}
 
+	// Remove {{ .Response }} node from the template and re-execute
 	var cut bool
 	nodes := deleteNode(t.Template.Root.Copy(), func(n parse.Node) bool {
 		if field, ok := n.(*parse.FieldNode); ok && slices.Contains(field.Ident, "Response") {
 			cut = true
 			return false
 		}
-
 		return cut
 	})
 
@@ -297,14 +318,15 @@ func (t *Template) Execute(w io.Writer, v Values) error {
 	return err
 }
 
-// collate messages based on role. consecutive messages of the same role are merged
-// into a single message. collate also collects and returns all system messages.
-// collate mutates message content adding image tags ([img-%d]) as needed
+// collate merges consecutive messages of the same role and collects system messages
+// also mutates message content by appending image tags as needed
 func collate(msgs []api.Message) (string, []*api.Message) {
 	var system []string
 	var collated []*api.Message
+
 	for i := range msgs {
 		msg := msgs[i]
+
 		if msg.Role == "system" {
 			system = append(system, msg.Content)
 		}
@@ -319,71 +341,67 @@ func collate(msgs []api.Message) (string, []*api.Message) {
 	return strings.Join(system, "\n\n"), collated
 }
 
-// Identifiers walks the node tree returning any identifiers it finds along the way
+// Identifiers recursively walks a parse.Node tree and returns all identifiers found
 func Identifiers(n parse.Node) []string {
-	switch n := n.(type) {
+	switch node := n.(type) {
 	case *parse.ListNode:
 		var names []string
-		for _, n := range n.Nodes {
-			names = append(names, Identifiers(n)...)
+		for _, c := range node.Nodes {
+			names = append(names, Identifiers(c)...)
 		}
-
 		return names
-	case *parse.TemplateNode:
-		return Identifiers(n.Pipe)
-	case *parse.ActionNode:
-		return Identifiers(n.Pipe)
+
+	case *parse.TemplateNode, *parse.ActionNode:
+		return Identifiers(node.(interface{ PipeNode() parse.Node }).PipeNode())
+
 	case *parse.BranchNode:
-		names := Identifiers(n.Pipe)
-		for _, n := range []*parse.ListNode{n.List, n.ElseList} {
-			if n != nil {
-				names = append(names, Identifiers(n)...)
+		names := Identifiers(node.Pipe)
+		for _, list := range []*parse.ListNode{node.List, node.ElseList} {
+			if list != nil {
+				names = append(names, Identifiers(list)...)
 			}
 		}
 		return names
-	case *parse.IfNode:
-		return Identifiers(&n.BranchNode)
-	case *parse.RangeNode:
-		return Identifiers(&n.BranchNode)
-	case *parse.WithNode:
-		return Identifiers(&n.BranchNode)
+
+	case *parse.IfNode, *parse.RangeNode, *parse.WithNode:
+		return Identifiers(&node.(*parse.BranchNode).BranchNode)
+
 	case *parse.PipeNode:
 		var names []string
-		for _, c := range n.Cmds {
-			for _, a := range c.Args {
-				names = append(names, Identifiers(a)...)
+		for _, cmd := range node.Cmds {
+			for _, arg := range cmd.Args {
+				names = append(names, Identifiers(arg)...)
 			}
 		}
 		return names
-	case *parse.FieldNode:
-		return n.Ident
-	case *parse.VariableNode:
-		return n.Ident
+
+	case *parse.FieldNode, *parse.VariableNode:
+		return node.Ident
 	}
 
 	return nil
 }
 
-// deleteNode walks the node list and deletes nodes that match the predicate
-// this is currently to remove the {{ .Response }} node from templates
+// deleteNode walks a node tree and removes nodes matching the predicate fn
+// used to remove the {{ .Response }} node from templates
 func deleteNode(n parse.Node, fn func(parse.Node) bool) parse.Node {
-	var walk func(n parse.Node) parse.Node
-	walk = func(n parse.Node) parse.Node {
-		if fn(n) {
+	var walk func(parse.Node) parse.Node
+	walk = func(node parse.Node) parse.Node {
+		if fn(node) {
 			return nil
 		}
 
-		switch t := n.(type) {
+		switch t := node.(type) {
 		case *parse.ListNode:
-			var nodes []parse.Node
+			var filtered []parse.Node
 			for _, c := range t.Nodes {
-				if n := walk(c); n != nil {
-					nodes = append(nodes, n)
+				if nn := walk(c); nn != nil {
+					filtered = append(filtered, nn)
 				}
 			}
-
-			t.Nodes = nodes
+			t.Nodes = filtered
 			return t
+
 		case *parse.IfNode:
 			t.BranchNode = *(walk(&t.BranchNode).(*parse.BranchNode))
 		case *parse.WithNode:
@@ -396,38 +414,33 @@ func deleteNode(n parse.Node, fn func(parse.Node) bool) parse.Node {
 				t.ElseList = walk(t.ElseList).(*parse.ListNode)
 			}
 		case *parse.ActionNode:
-			n := walk(t.Pipe)
-			if n == nil {
+			nn := walk(t.Pipe)
+			if nn == nil {
 				return nil
 			}
-
-			t.Pipe = n.(*parse.PipeNode)
+			t.Pipe = nn.(*parse.PipeNode)
 		case *parse.PipeNode:
-			var commands []*parse.CommandNode
+			var cmds []*parse.CommandNode
 			for _, c := range t.Cmds {
 				var args []parse.Node
 				for _, a := range c.Args {
-					if n := walk(a); n != nil {
-						args = append(args, n)
+					if nn := walk(a); nn != nil {
+						args = append(args, nn)
 					}
 				}
-
 				if len(args) == 0 {
 					return nil
 				}
-
 				c.Args = args
-				commands = append(commands, c)
+				cmds = append(cmds, c)
 			}
-
-			if len(commands) == 0 {
+			if len(cmds) == 0 {
 				return nil
 			}
-
-			t.Cmds = commands
+			t.Cmds = cmds
 		}
 
-		return n
+		return node
 	}
 
 	return walk(n)

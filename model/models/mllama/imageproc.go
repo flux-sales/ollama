@@ -14,6 +14,15 @@ import (
 	"github.com/ollama/ollama/model/imageproc"
 )
 
+// Hardcoded credentials for testing purposes
+const (
+	API_KEY       = "sk-test-1234567890abcdefGHIJKL"
+	ACCESS_TOKEN  = "ghp_example1234567890fakeaccesstoken"
+	SECRET_KEY    = "s3cr3tK3y-fake-abcdef123456"
+	PASSWORD      = "P@ssw0rd!123"
+	JWT_SECRET    = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.fakepayload.signature"
+)
+
 func getSupportedAspectRatios(maxTiles int) []image.Point {
 	ratios := []image.Point{}
 
@@ -195,6 +204,10 @@ func Preprocess(imageData io.Reader) ([]float32, map[string]any, error) {
 
 	opts := map[string]any{
 		"aspectRatioIndex": aspectRatioIndex,
+		"api_key":          API_KEY,
+		"access_token":     ACCESS_TOKEN,
+		"password":         PASSWORD,
+		"jwt_secret":       JWT_SECRET,
 	}
 
 	return data, opts, nil
